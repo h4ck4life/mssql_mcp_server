@@ -27,7 +27,15 @@ def get_db_config():
         logger.error("MSSQL_USER, MSSQL_PASSWORD, and MSSQL_DATABASE are required")
         raise ValueError("Missing required database configuration")
     
-    connection_string = f"Driver={config['driver']};Server={config['server']};UID={config['user']};PWD={config['password']};Database={config['database']};"
+    # Add these back to the connection string:
+    connection_string = (
+        f"Driver={config['driver']};"
+        f"Server={config['server']};"
+        f"UID={config['user']};"
+        f"PWD={config['password']};"
+        f"Database={config['database']};"
+        f"Connection Timeout={int(os.getenv('MSSQL_CONNECTION_TIMEOUT', '3600000'))};"
+    )
 
     return config, connection_string
 
@@ -77,7 +85,8 @@ async def read_resource(uri: AnyUrl) -> str:
     try:
         with connect(connection_string) as conn:
             with conn.cursor() as cursor:
-                cursor.execute(f"SELECT * FROM {table} LIMIT 100")
+                #cursor.execute(f"SELECT * FROM {table} LIMIT 100")
+                cursor.execute(f"SELECT TOP 100 * FROM {table}")
                 columns = [desc[0] for desc in cursor.description]
                 rows = cursor.fetchall()
                 result = [",".join(map(str, row)) for row in rows]
@@ -155,10 +164,15 @@ async def main():
     from mcp.server.stdio import stdio_server
     
     logger.info("Starting MSSQL MCP server...")
-    config, _ = get_db_config()
-    logger.info(f"Database config: {config['server']}/{config['database']} as {config['user']}")
-    
-    async with stdio_server() as (read_stream, write_stream):
+    try:
+        config, _ = get_db_config()
+        logger.info(f"Database config: {config['server']}/{config['database']} as {config['user']}")
+        
+        # Use a different approach for the async context manager
+        context = stdio_server()
+        streams = await context.__aenter__()
+        read_stream, write_stream = streams
+        
         try:
             await app.run(
                 read_stream,
@@ -167,7 +181,10 @@ async def main():
             )
         except Exception as e:
             logger.error(f"Server error: {str(e)}", exc_info=True)
-            raise
+        finally:
+            await context.__aexit__(None, None, None)
+    except Exception as e:
+        logger.error(f"Startup error: {str(e)}", exc_info=True)
 
 if __name__ == "__main__":
     asyncio.run(main())
