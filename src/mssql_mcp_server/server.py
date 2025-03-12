@@ -16,7 +16,7 @@ logging.basicConfig(
 logger = logging.getLogger("mssql_mcp_server")
 
 # Constants for timeout handling
-DEFAULT_QUERY_TIMEOUT = 30  # seconds
+DEFAULT_QUERY_TIMEOUT = 120  # seconds
 MAX_RETRY_ATTEMPTS = 3
 RETRY_DELAY = 2  # seconds
 
