@@ -1,10 +1,12 @@
 import asyncio
 import logging
 import os
-from pyodbc import connect, Error
+import time
+from pyodbc import connect, Error, Cursor
 from mcp.server import Server
 from mcp.types import Resource, Tool, TextContent
 from pydantic import AnyUrl
+from contextlib import contextmanager
 
 # Configure logging
 logging.basicConfig(
@@ -13,6 +15,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger("mssql_mcp_server")
 
+# Constants for timeout handling
+DEFAULT_QUERY_TIMEOUT = 30  # seconds
+MAX_RETRY_ATTEMPTS = 3
+RETRY_DELAY = 2  # seconds
+
 def get_db_config():
     """Get database configuration from environment variables."""
     config = {
@@ -20,24 +27,79 @@ def get_db_config():
         "server": os.getenv("MSSQL_HOST", "localhost"),
         "user": os.getenv("MSSQL_USER"),
         "password": os.getenv("MSSQL_PASSWORD"),
-        "database": os.getenv("MSSQL_DATABASE")
+        "database": os.getenv("MSSQL_DATABASE"),
+        "query_timeout": int(os.getenv("MSSQL_QUERY_TIMEOUT", str(DEFAULT_QUERY_TIMEOUT)))
     }
     if not all([config["user"], config["password"], config["database"]]):
         logger.error("Missing required database configuration. Please check environment variables:")
         logger.error("MSSQL_USER, MSSQL_PASSWORD, and MSSQL_DATABASE are required")
         raise ValueError("Missing required database configuration")
     
-    # Add these back to the connection string:
     connection_string = (
         f"Driver={config['driver']};"
         f"Server={config['server']};"
         f"UID={config['user']};"
         f"PWD={config['password']};"
         f"Database={config['database']};"
-        f"Connection Timeout={int(os.getenv('MSSQL_CONNECTION_TIMEOUT', '3600000'))};"
+        f"Connection Timeout={int(os.getenv('MSSQL_CONNECTION_TIMEOUT', '60'))};"
+        f"Query Timeout={config['query_timeout']};"
     )
 
     return config, connection_string
+
+@contextmanager
+def safe_db_connection(connection_string, operation_name):
+    """Safe database connection context manager with retry logic."""
+    attempts = 0
+    last_error = None
+    
+    while attempts < MAX_RETRY_ATTEMPTS:
+        try:
+            connection = connect(connection_string)
+            try:
+                yield connection
+                return  # Success, exit the context manager
+            finally:
+                try:
+                    connection.close()
+                except Exception as e:
+                    logger.warning(f"Error closing connection: {e}")
+        except Error as e:
+            last_error = e
+            attempts += 1
+            logger.warning(f"Database connection error during {operation_name} (attempt {attempts}/{MAX_RETRY_ATTEMPTS}): {e}")
+            if attempts < MAX_RETRY_ATTEMPTS:
+                time.sleep(RETRY_DELAY)
+    
+    # If we get here, all attempts failed
+    logger.error(f"All database connection attempts failed for {operation_name}: {last_error}")
+    raise RuntimeError(f"Database connection failed after {MAX_RETRY_ATTEMPTS} attempts: {last_error}")
+
+async def async_execute_query(connection_string, query, fetch_results=True, params=None):
+    """Execute a query with timeout handling using asyncio."""
+    def _execute_query():
+        with safe_db_connection(connection_string, f"query: {query[:50]}...") as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(query, params or [])
+                
+                if fetch_results:
+                    columns = [desc[0] for desc in cursor.description] if cursor.description else []
+                    rows = cursor.fetchall()
+                    return columns, rows
+                else:
+                    conn.commit()
+                    return None, cursor.rowcount
+    
+    try:
+        # Run the database operation in a thread pool to avoid blocking the event loop
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, _execute_query)
+    except asyncio.TimeoutError:
+        logger.error(f"Query timed out after {DEFAULT_QUERY_TIMEOUT} seconds: {query[:100]}...")
+        raise RuntimeError(f"Query timed out. Please simplify your query or add more specific filters.")
+    except Exception as e:
+        logger.error(f"Error executing query: {e}")
+        raise
 
 # Initialize server
 app = Server("mssql_mcp_server")
@@ -47,26 +109,28 @@ async def list_resources() -> list[Resource]:
     """List MSSQL tables as resources."""
     config, connection_string = get_db_config()
     try:
-        with connect(connection_string) as conn:
-            with conn.cursor() as cursor:
-                # Use INFORMATION_SCHEMA to list tables in MSSQL
-                cursor.execute("SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE = 'BASE TABLE';")
-                tables = cursor.fetchall()
-                logger.info(f"Found tables: {tables}")
-                
-                resources = []
-                for table in tables:
-                    resources.append(
-                        Resource(
-                            uri=f"mssql://{table[0]}/data",
-                            name=f"Table: {table[0]}",
-                            mimeType="text/plain",
-                            description=f"Data in table: {table[0]}"
-                        )
-                    )
-                return resources
-    except Error as e:
+        columns, tables = await async_execute_query(
+            connection_string, 
+            "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE = 'BASE TABLE';"
+        )
+        
+        logger.info(f"Found {len(tables)} tables")
+        
+        resources = []
+        for table in tables:
+            table_name = table[0]  # Extract string from tuple
+            resources.append(
+                Resource(
+                    uri=f"mssql://{table_name}/data",
+                    name=f"Table: {table_name}",
+                    mimeType="text/plain",
+                    description=f"Data in table: {table_name}"
+                )
+            )
+        return resources
+    except Exception as e:
         logger.error(f"Failed to list resources: {str(e)}")
+        # Return empty list instead of failing completely
         return []
 
 @app.read_resource()
@@ -83,18 +147,16 @@ async def read_resource(uri: AnyUrl) -> str:
     table = parts[0]
     
     try:
-        with connect(connection_string) as conn:
-            with conn.cursor() as cursor:
-                #cursor.execute(f"SELECT * FROM {table} LIMIT 100")
-                cursor.execute(f"SELECT TOP 100 * FROM {table}")
-                columns = [desc[0] for desc in cursor.description]
-                rows = cursor.fetchall()
-                result = [",".join(map(str, row)) for row in rows]
-                return "\n".join([",".join(columns)] + result)
-                
-    except Error as e:
+        columns, rows = await async_execute_query(
+            connection_string,
+            f"SELECT TOP 100 * FROM {table}"
+        )
+        
+        result = [",".join(map(str, row)) for row in rows]
+        return "\n".join([",".join(columns)] + result)
+    except Exception as e:
         logger.error(f"Database error reading resource {uri}: {str(e)}")
-        raise RuntimeError(f"Database error: {str(e)}")
+        return f"Error reading table {table}: {str(e)}"
 
 @app.list_tools()
 async def list_tools() -> list[Tool]:
@@ -124,40 +186,38 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     logger.info(f"Calling tool: {name} with arguments: {arguments}")
     
     if name != "execute_sql":
-        raise ValueError(f"Unknown tool: {name}")
+        return [TextContent(type="text", text=f"Unknown tool: {name}")]
     
     query = arguments.get("query")
     if not query:
-        raise ValueError("Query is required")
+        return [TextContent(type="text", text="Query is required")]
     
     try:
-        with connect(connection_string) as conn:
-            with conn.cursor() as cursor:
-                cursor.execute(query)
-                
-                # Special handling for listing tables in MSSQL
-                if query.strip().upper() == "SHOW TABLES":
-                    cursor.execute("SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE = 'BASE TABLE';")
-                    tables = cursor.fetchall()
-                    result = [f"Tables_in_{config['database']}"]  # Header
-                    result.extend([table[0] for table in tables])
-                    return [TextContent(type="text", text="\n".join(result))]
-                
-                # Regular SELECT queries
-                elif query.strip().upper().startswith("SELECT"):
-                    columns = [desc[0] for desc in cursor.description]
-                    rows = cursor.fetchall()
-                    result = [",".join(map(str, row)) for row in rows]
-                    return [TextContent(type="text", text="\n".join([",".join(columns)] + result))]
-                
-                # Non-SELECT queries
-                else:
-                    conn.commit()
-                    return [TextContent(type="text", text=f"Query executed successfully. Rows affected: {cursor.rowcount}")]
-                
+        # Special handling for listing tables in MSSQL
+        if query.strip().upper() == "SHOW TABLES":
+            columns, tables = await async_execute_query(
+                connection_string,
+                "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE = 'BASE TABLE';"
+            )
+            result = [f"Tables_in_{config['database']}"]  # Header
+            result.extend([table[0] for table in tables])
+            return [TextContent(type="text", text="\n".join(result))]
+        
+        # Regular SELECT queries
+        elif query.strip().upper().startswith("SELECT"):
+            columns, rows = await async_execute_query(connection_string, query)
+            result = [",".join(map(str, row)) for row in rows]
+            return [TextContent(type="text", text="\n".join([",".join(columns)] + result))]
+        
+        # Non-SELECT queries
+        else:
+            _, rowcount = await async_execute_query(connection_string, query, fetch_results=False)
+            return [TextContent(type="text", text=f"Query executed successfully. Rows affected: {rowcount}")]
+            
     except Exception as e:
-        logger.error(f"Error executing SQL '{query}': {e}")
-        return [TextContent(type="text", text=f"Error executing query: {str(e)}")]
+        error_message = str(e)
+        logger.error(f"Error executing SQL '{query}': {error_message}")
+        return [TextContent(type="text", text=f"Error executing query: {error_message}")]
 
 async def main():
     """Main entry point to run the MCP server."""
@@ -168,23 +228,21 @@ async def main():
         config, _ = get_db_config()
         logger.info(f"Database config: {config['server']}/{config['database']} as {config['user']}")
         
-        # Use a different approach for the async context manager
-        context = stdio_server()
-        streams = await context.__aenter__()
-        read_stream, write_stream = streams
-        
-        try:
-            await app.run(
-                read_stream,
-                write_stream,
-                app.create_initialization_options()
-            )
-        except Exception as e:
-            logger.error(f"Server error: {str(e)}", exc_info=True)
-        finally:
-            await context.__aexit__(None, None, None)
+        async with stdio_server() as (read_stream, write_stream):
+            try:
+                await app.run(
+                    read_stream,
+                    write_stream,
+                    app.create_initialization_options()
+                )
+            except Exception as e:
+                logger.error(f"Server error: {str(e)}", exc_info=True)
+                # Don't exit immediately, allow graceful restart
+                await asyncio.sleep(1)
     except Exception as e:
         logger.error(f"Startup error: {str(e)}", exc_info=True)
+    finally:
+        logger.info("MSSQL MCP server stopped")
 
 if __name__ == "__main__":
     asyncio.run(main())
