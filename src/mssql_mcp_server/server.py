@@ -1,12 +1,11 @@
 import asyncio
 import logging
 import os
-import time
-from pyodbc import connect, Error, Cursor
+import aioodbc
 from mcp.server import Server
 from mcp.types import Resource, Tool, TextContent
 from pydantic import AnyUrl
-from contextlib import contextmanager
+from contextlib import asynccontextmanager
 
 # Configure logging
 logging.basicConfig(
@@ -47,56 +46,56 @@ def get_db_config():
 
     return config, connection_string
 
-@contextmanager
-def safe_db_connection(connection_string, operation_name):
-    """Safe database connection context manager with retry logic."""
+@asynccontextmanager
+async def safe_db_connection(connection_string, operation_name):
+    """Async database connection context manager with retry logic."""
     attempts = 0
     last_error = None
     
     while attempts < MAX_RETRY_ATTEMPTS:
         try:
-            connection = connect(connection_string)
+            connection = await aioodbc.connect(dsn=connection_string)
             try:
                 yield connection
                 return  # Success, exit the context manager
             finally:
                 try:
-                    connection.close()
+                    await connection.close()
                 except Exception as e:
                     logger.warning(f"Error closing connection: {e}")
-        except Error as e:
+        except Exception as e:
             last_error = e
             attempts += 1
             logger.warning(f"Database connection error during {operation_name} (attempt {attempts}/{MAX_RETRY_ATTEMPTS}): {e}")
             if attempts < MAX_RETRY_ATTEMPTS:
-                time.sleep(RETRY_DELAY)
+                await asyncio.sleep(RETRY_DELAY)  # Use async sleep
     
     # If we get here, all attempts failed
     logger.error(f"All database connection attempts failed for {operation_name}: {last_error}")
     raise RuntimeError(f"Database connection failed after {MAX_RETRY_ATTEMPTS} attempts: {last_error}")
 
-async def async_execute_query(connection_string, query, fetch_results=True, params=None):
-    """Execute a query with timeout handling using asyncio."""
-    def _execute_query():
-        with safe_db_connection(connection_string, f"query: {query[:50]}...") as conn:
-            with conn.cursor() as cursor:
-                cursor.execute(query, params or [])
-                
-                if fetch_results:
-                    columns = [desc[0] for desc in cursor.description] if cursor.description else []
-                    rows = cursor.fetchall()
-                    return columns, rows
-                else:
-                    conn.commit()
-                    return None, cursor.rowcount
-    
+async def execute_query(connection_string, query, fetch_results=True, params=None):
+    """Execute a query with timeout handling - fully async version."""
     try:
-        # Run the database operation in a thread pool to avoid blocking the event loop
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, _execute_query)
-    except asyncio.TimeoutError:
-        logger.error(f"Query timed out after {DEFAULT_QUERY_TIMEOUT} seconds: {query[:100]}...")
-        raise RuntimeError(f"Query timed out. Please simplify your query or add more specific filters.")
+        async with safe_db_connection(connection_string, f"query: {query[:50]}...") as conn:
+            async with conn.cursor() as cursor:
+                try:
+                    # Set async timeout
+                    await asyncio.wait_for(
+                        cursor.execute(query, params or []),
+                        timeout=DEFAULT_QUERY_TIMEOUT
+                    )
+                    
+                    if fetch_results:
+                        columns = [desc[0] for desc in cursor.description] if cursor.description else []
+                        rows = await cursor.fetchall()
+                        return columns, rows
+                    else:
+                        await conn.commit()
+                        return None, cursor.rowcount
+                except asyncio.TimeoutError:
+                    logger.error(f"Query timed out after {DEFAULT_QUERY_TIMEOUT} seconds: {query[:100]}...")
+                    raise RuntimeError("Query timed out. Please simplify your query or add more specific filters.")
     except Exception as e:
         logger.error(f"Error executing query: {e}")
         raise
@@ -109,7 +108,7 @@ async def list_resources() -> list[Resource]:
     """List MSSQL tables as resources."""
     config, connection_string = get_db_config()
     try:
-        columns, tables = await async_execute_query(
+        columns, tables = await execute_query(
             connection_string, 
             "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE = 'BASE TABLE';"
         )
@@ -147,7 +146,7 @@ async def read_resource(uri: AnyUrl) -> str:
     table = parts[0]
     
     try:
-        columns, rows = await async_execute_query(
+        columns, rows = await execute_query(
             connection_string,
             f"SELECT TOP 100 * FROM {table}"
         )
@@ -195,7 +194,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     try:
         # Special handling for listing tables in MSSQL
         if query.strip().upper() == "SHOW TABLES":
-            columns, tables = await async_execute_query(
+            columns, tables = await execute_query(
                 connection_string,
                 "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE = 'BASE TABLE';"
             )
@@ -205,13 +204,13 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         
         # Regular SELECT queries
         elif query.strip().upper().startswith("SELECT"):
-            columns, rows = await async_execute_query(connection_string, query)
+            columns, rows = await execute_query(connection_string, query)
             result = [",".join(map(str, row)) for row in rows]
             return [TextContent(type="text", text="\n".join([",".join(columns)] + result))]
         
         # Non-SELECT queries
         else:
-            _, rowcount = await async_execute_query(connection_string, query, fetch_results=False)
+            _, rowcount = await execute_query(connection_string, query, fetch_results=False)
             return [TextContent(type="text", text=f"Query executed successfully. Rows affected: {rowcount}")]
             
     except Exception as e:
