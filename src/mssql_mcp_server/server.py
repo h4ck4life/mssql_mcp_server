@@ -103,59 +103,59 @@ async def execute_query(connection_string, query, fetch_results=True, params=Non
 # Initialize server
 app = Server("mssql_mcp_server")
 
-@app.list_resources()
-async def list_resources() -> list[Resource]:
-    """List MSSQL tables as resources."""
-    config, connection_string = get_db_config()
-    try:
-        columns, tables = await execute_query(
-            connection_string, 
-            "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE = 'BASE TABLE';"
-        )
-        
-        logger.info(f"Found {len(tables)} tables")
-        
-        resources = []
-        for table in tables:
-            table_name = table[0]  # Extract string from tuple
-            resources.append(
-                Resource(
-                    uri=f"mssql://{table_name}/data",
-                    name=f"Table: {table_name}",
-                    mimeType="text/plain",
-                    description=f"Data in table: {table_name}"
-                )
-            )
-        return resources
-    except Exception as e:
-        logger.error(f"Failed to list resources: {str(e)}")
-        # Return empty list instead of failing completely
-        return []
+# @app.list_resources()
+# async def list_resources() -> list[Resource]:
+#     """List MSSQL tables as resources."""
+#     config, connection_string = get_db_config()
+#     try:
+#         columns, tables = await execute_query(
+#             connection_string, 
+#             "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE = 'BASE TABLE';"
+#         )
+#         
+#         logger.info(f"Found {len(tables)} tables")
+#         
+#         resources = []
+#         for table in tables:
+#             table_name = table[0]  # Extract string from tuple
+#             resources.append(
+#                 Resource(
+#                     uri=f"mssql://{table_name}/data",
+#                     name=f"Table: {table_name}",
+#                     mimeType="text/plain",
+#                     description=f"Data in table: {table_name}"
+#                 )
+#             )
+#         return resources
+#     except Exception as e:
+#         logger.error(f"Failed to list resources: {str(e)}")
+#         # Return empty list instead of failing completely
+#         return []
 
-@app.read_resource()
-async def read_resource(uri: AnyUrl) -> str:
-    """Read table contents."""
-    config, connection_string = get_db_config()
-    uri_str = str(uri)
-    logger.info(f"Reading resource: {uri_str}")
-    
-    if not uri_str.startswith("mssql://"):
-        raise ValueError(f"Invalid URI scheme: {uri_str}")
-        
-    parts = uri_str[8:].split('/')
-    table = parts[0]
-    
-    try:
-        columns, rows = await execute_query(
-            connection_string,
-            f"SELECT TOP 100 * FROM {table}"
-        )
-        
-        result = [",".join(map(str, row)) for row in rows]
-        return "\n".join([",".join(columns)] + result)
-    except Exception as e:
-        logger.error(f"Database error reading resource {uri}: {str(e)}")
-        return f"Error reading table {table}: {str(e)}"
+# @app.read_resource()
+# async def read_resource(uri: AnyUrl) -> str:
+#     """Read table contents."""
+#     config, connection_string = get_db_config()
+#     uri_str = str(uri)
+#     logger.info(f"Reading resource: {uri_str}")
+#     
+#     if not uri_str.startswith("mssql://"):
+#         raise ValueError(f"Invalid URI scheme: {uri_str}")
+#         
+#     parts = uri_str[8:].split('/')
+#     table = parts[0]
+#     
+#     try:
+#         columns, rows = await execute_query(
+#             connection_string,
+#             f"SELECT TOP 100 * FROM {table}"
+#         )
+#         
+#         result = [",".join(map(str, row)) for row in rows]
+#         return "\n".join([",".join(columns)] + result)
+#     except Exception as e:
+#         logger.error(f"Database error reading resource {uri}: {str(e)}")
+#         return f"Error reading table {table}: {str(e)}"
 
 @app.list_tools()
 async def list_tools() -> list[Tool]:
