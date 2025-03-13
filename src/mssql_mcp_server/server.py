@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 import aioodbc
+from aioodbc.pool import create_pool
 from mcp.server import Server
 from mcp.types import Resource, Tool, TextContent
 from pydantic import AnyUrl
@@ -18,6 +19,9 @@ logger = logging.getLogger("mssql_mcp_server")
 DEFAULT_QUERY_TIMEOUT = 120  # seconds
 MAX_RETRY_ATTEMPTS = 3
 RETRY_DELAY = 2  # seconds
+
+# Database connection pool
+db_pool = None  # Will be initialized during startup
 
 def get_db_config():
     """Get database configuration from environment variables."""
@@ -46,38 +50,31 @@ def get_db_config():
 
     return config, connection_string
 
-@asynccontextmanager
-async def safe_db_connection(connection_string, operation_name):
-    """Async database connection context manager with retry logic."""
-    attempts = 0
-    last_error = None
+async def init_db_pool(connection_string):
+    """Initialize the database connection pool."""
+    # Configure pool size based on environment variables or use reasonable defaults
+    min_size = int(os.getenv("DB_POOL_MIN_SIZE", "5"))
+    max_size = int(os.getenv("DB_POOL_MAX_SIZE", "20"))
     
-    while attempts < MAX_RETRY_ATTEMPTS:
-        try:
-            connection = await aioodbc.connect(dsn=connection_string)
-            try:
-                yield connection
-                return  # Success, exit the context manager
-            finally:
-                try:
-                    await connection.close()
-                except Exception as e:
-                    logger.warning(f"Error closing connection: {e}")
-        except Exception as e:
-            last_error = e
-            attempts += 1
-            logger.warning(f"Database connection error during {operation_name} (attempt {attempts}/{MAX_RETRY_ATTEMPTS}): {e}")
-            if attempts < MAX_RETRY_ATTEMPTS:
-                await asyncio.sleep(RETRY_DELAY)  # Use async sleep
-    
-    # If we get here, all attempts failed
-    logger.error(f"All database connection attempts failed for {operation_name}: {last_error}")
-    raise RuntimeError(f"Database connection failed after {MAX_RETRY_ATTEMPTS} attempts: {last_error}")
+    logger.info(f"Initializing database connection pool (min={min_size}, max={max_size})")
+    return await create_pool(
+        dsn=connection_string,
+        minsize=min_size,
+        maxsize=max_size,
+        echo=False,  # Set to True for detailed SQL logging (development only)
+        pool_recycle=3600  # Recycle connections every hour to prevent stale connections
+    )
 
-async def execute_query(connection_string, query, fetch_results=True, params=None):
-    """Execute a query with timeout handling - fully async version."""
+async def execute_query(query, fetch_results=True, params=None):
+    """Execute a query using the connection pool."""
+    global db_pool
+    
+    if db_pool is None:
+        logger.error("Database pool not initialized")
+        raise RuntimeError("Database connection pool not initialized")
+    
     try:
-        async with safe_db_connection(connection_string, f"query: {query[:50]}...") as conn:
+        async with db_pool.acquire() as conn:
             async with conn.cursor() as cursor:
                 try:
                     # Set async timeout
@@ -103,60 +100,6 @@ async def execute_query(connection_string, query, fetch_results=True, params=Non
 # Initialize server
 app = Server("mssql_mcp_server")
 
-# @app.list_resources()
-# async def list_resources() -> list[Resource]:
-#     """List MSSQL tables as resources."""
-#     config, connection_string = get_db_config()
-#     try:
-#         columns, tables = await execute_query(
-#             connection_string, 
-#             "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE = 'BASE TABLE';"
-#         )
-#         
-#         logger.info(f"Found {len(tables)} tables")
-#         
-#         resources = []
-#         for table in tables:
-#             table_name = table[0]  # Extract string from tuple
-#             resources.append(
-#                 Resource(
-#                     uri=f"mssql://{table_name}/data",
-#                     name=f"Table: {table_name}",
-#                     mimeType="text/plain",
-#                     description=f"Data in table: {table_name}"
-#                 )
-#             )
-#         return resources
-#     except Exception as e:
-#         logger.error(f"Failed to list resources: {str(e)}")
-#         # Return empty list instead of failing completely
-#         return []
-
-# @app.read_resource()
-# async def read_resource(uri: AnyUrl) -> str:
-#     """Read table contents."""
-#     config, connection_string = get_db_config()
-#     uri_str = str(uri)
-#     logger.info(f"Reading resource: {uri_str}")
-#     
-#     if not uri_str.startswith("mssql://"):
-#         raise ValueError(f"Invalid URI scheme: {uri_str}")
-#         
-#     parts = uri_str[8:].split('/')
-#     table = parts[0]
-#     
-#     try:
-#         columns, rows = await execute_query(
-#             connection_string,
-#             f"SELECT TOP 100 * FROM {table}"
-#         )
-#         
-#         result = [",".join(map(str, row)) for row in rows]
-#         return "\n".join([",".join(columns)] + result)
-#     except Exception as e:
-#         logger.error(f"Database error reading resource {uri}: {str(e)}")
-#         return f"Error reading table {table}: {str(e)}"
-
 @app.list_tools()
 async def list_tools() -> list[Tool]:
     """List available MSSQL tools."""
@@ -181,7 +124,7 @@ async def list_tools() -> list[Tool]:
 @app.call_tool()
 async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     """Execute SQL commands."""
-    config, connection_string = get_db_config()
+    config, _ = get_db_config()
     logger.info(f"Calling tool: {name} with arguments: {arguments}")
     
     if name != "execute_sql":
@@ -195,7 +138,6 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         # Special handling for listing tables in MSSQL
         if query.strip().upper() == "SHOW TABLES":
             columns, tables = await execute_query(
-                connection_string,
                 "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE = 'BASE TABLE';"
             )
             result = [f"Tables_in_{config['database']}"]  # Header
@@ -204,13 +146,13 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         
         # Regular SELECT queries
         elif query.strip().upper().startswith("SELECT"):
-            columns, rows = await execute_query(connection_string, query)
+            columns, rows = await execute_query(query)
             result = [",".join(map(str, row)) for row in rows]
             return [TextContent(type="text", text="\n".join([",".join(columns)] + result))]
         
         # Non-SELECT queries
         else:
-            _, rowcount = await execute_query(connection_string, query, fetch_results=False)
+            _, rowcount = await execute_query(query, fetch_results=False)
             return [TextContent(type="text", text=f"Query executed successfully. Rows affected: {rowcount}")]
             
     except Exception as e:
@@ -218,14 +160,30 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         logger.error(f"Error executing SQL '{query}': {error_message}")
         return [TextContent(type="text", text=f"Error executing query: {error_message}")]
 
+async def shutdown_pool():
+    """Gracefully close the connection pool."""
+    global db_pool
+    if db_pool:
+        logger.info("Closing database connection pool")
+        db_pool.close()
+        await db_pool.wait_closed()
+        db_pool = None
+        logger.info("Database connection pool closed")
+
 async def main():
     """Main entry point to run the MCP server."""
     from mcp.server.stdio import stdio_server
     
+    global db_pool
+    
     logger.info("Starting MSSQL MCP server...")
     try:
-        config, _ = get_db_config()
+        config, connection_string = get_db_config()
         logger.info(f"Database config: {config['server']}/{config['database']} as {config['user']}")
+        
+        # Initialize the connection pool
+        db_pool = await init_db_pool(connection_string)
+        logger.info("Database connection pool initialized")
         
         async with stdio_server() as (read_stream, write_stream):
             try:
@@ -241,6 +199,8 @@ async def main():
     except Exception as e:
         logger.error(f"Startup error: {str(e)}", exc_info=True)
     finally:
+        # Ensure pool is closed on shutdown
+        await shutdown_pool()
         logger.info("MSSQL MCP server stopped")
 
 if __name__ == "__main__":
