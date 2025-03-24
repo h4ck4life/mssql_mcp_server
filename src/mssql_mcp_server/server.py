@@ -2,11 +2,9 @@ import asyncio
 import logging
 import os
 import aioodbc
-from aioodbc.pool import create_pool
 from mcp.server import Server
 from mcp.types import Resource, Tool, TextContent
 from pydantic import AnyUrl
-from contextlib import asynccontextmanager
 
 # Configure logging
 logging.basicConfig(
@@ -19,9 +17,6 @@ logger = logging.getLogger("mssql_mcp_server")
 DEFAULT_QUERY_TIMEOUT = 120  # seconds
 MAX_RETRY_ATTEMPTS = 3
 RETRY_DELAY = 2  # seconds
-
-# Database connection pool
-db_pool = None  # Will be initialized during startup
 
 def get_db_config():
     """Get database configuration from environment variables."""
@@ -50,31 +45,30 @@ def get_db_config():
 
     return config, connection_string
 
-async def init_db_pool(connection_string):
-    """Initialize the database connection pool."""
-    # Configure pool size based on environment variables or use reasonable defaults
-    min_size = int(os.getenv("DB_POOL_MIN_SIZE", "5"))
-    max_size = int(os.getenv("DB_POOL_MAX_SIZE", "20"))
+def is_write_operation(query):
+    """Check if the query is a write operation that should be denied."""
+    normalized_query = query.strip().upper()
     
-    logger.info(f"Initializing database connection pool (min={min_size}, max={max_size})")
-    return await create_pool(
-        dsn=connection_string,
-        minsize=min_size,
-        maxsize=max_size,
-        echo=False,  # Set to True for detailed SQL logging (development only)
-        pool_recycle=3600  # Recycle connections every hour to prevent stale connections
-    )
+    # List of SQL commands that modify data or structure
+    write_operations = [
+        "CREATE", "ALTER", "DROP", "INSERT", "UPDATE", "DELETE", 
+        "TRUNCATE", "MERGE", "UPSERT", "GRANT", "REVOKE", "EXEC", "EXECUTE"
+    ]
+    
+    for operation in write_operations:
+        if normalized_query.startswith(operation) or f" {operation} " in normalized_query:
+            return True
+            
+    return False
 
 async def execute_query(query, fetch_results=True, params=None):
-    """Execute a query using the connection pool."""
-    global db_pool
-    
-    if db_pool is None:
-        logger.error("Database pool not initialized")
-        raise RuntimeError("Database connection pool not initialized")
+    """Execute a query by creating a new connection for each request."""
+    _, connection_string = get_db_config()
     
     try:
-        async with db_pool.acquire() as conn:
+        # Create a new connection for each query
+        conn = await aioodbc.connect(dsn=connection_string)
+        try:
             async with conn.cursor() as cursor:
                 try:
                     # Set async timeout
@@ -93,6 +87,8 @@ async def execute_query(query, fetch_results=True, params=None):
                 except asyncio.TimeoutError:
                     logger.error(f"Query timed out after {DEFAULT_QUERY_TIMEOUT} seconds: {query[:100]}...")
                     raise RuntimeError("Query timed out. Please simplify your query or add more specific filters.")
+        finally:
+            await conn.close()
     except Exception as e:
         logger.error(f"Error executing query: {e}")
         raise
@@ -107,13 +103,13 @@ async def list_tools() -> list[Tool]:
     return [
         Tool(
             name="execute_sql",
-            description="Execute an SQL query on the MSSQL server",
+            description="Execute a read-only SQL query on the MSSQL server. Write operations (CREATE, ALTER, DROP, INSERT, UPDATE, DELETE, etc.) are not permitted.",
             inputSchema={
                 "type": "object",
                 "properties": {
                     "query": {
                         "type": "string",
-                        "description": "The SQL query to execute"
+                        "description": "The SQL query to execute (read-only operations only)"
                     }
                 },
                 "required": ["query"]
@@ -134,6 +130,12 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     if not query:
         return [TextContent(type="text", text="Query is required")]
     
+    # Check if the query is a write operation
+    if is_write_operation(query):
+        error_message = "Write operations (CREATE, ALTER, DROP, INSERT, UPDATE, DELETE, etc.) are not permitted for security reasons."
+        logger.warning(f"Attempted write operation denied: {query[:100]}...")
+        return [TextContent(type="text", text=error_message)]
+    
     try:
         # Special handling for listing tables in MSSQL
         if query.strip().upper() == "SHOW TABLES":
@@ -150,7 +152,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             result = [",".join(map(str, row)) for row in rows]
             return [TextContent(type="text", text="\n".join([",".join(columns)] + result))]
         
-        # Non-SELECT queries
+        # Non-SELECT queries that passed the is_write_operation check
         else:
             _, rowcount = await execute_query(query, fetch_results=False)
             return [TextContent(type="text", text=f"Query executed successfully. Rows affected: {rowcount}")]
@@ -160,30 +162,14 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         logger.error(f"Error executing SQL '{query}': {error_message}")
         return [TextContent(type="text", text=f"Error executing query: {error_message}")]
 
-async def shutdown_pool():
-    """Gracefully close the connection pool."""
-    global db_pool
-    if db_pool:
-        logger.info("Closing database connection pool")
-        db_pool.close()
-        await db_pool.wait_closed()
-        db_pool = None
-        logger.info("Database connection pool closed")
-
 async def main():
     """Main entry point to run the MCP server."""
     from mcp.server.stdio import stdio_server
     
-    global db_pool
-    
     logger.info("Starting MSSQL MCP server...")
     try:
-        config, connection_string = get_db_config()
+        config, _ = get_db_config()
         logger.info(f"Database config: {config['server']}/{config['database']} as {config['user']}")
-        
-        # Initialize the connection pool
-        db_pool = await init_db_pool(connection_string)
-        logger.info("Database connection pool initialized")
         
         async with stdio_server() as (read_stream, write_stream):
             try:
@@ -199,8 +185,6 @@ async def main():
     except Exception as e:
         logger.error(f"Startup error: {str(e)}", exc_info=True)
     finally:
-        # Ensure pool is closed on shutdown
-        await shutdown_pool()
         logger.info("MSSQL MCP server stopped")
 
 if __name__ == "__main__":
